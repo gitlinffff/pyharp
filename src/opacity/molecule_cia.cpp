@@ -1,8 +1,12 @@
-// harp
-#include "molecule_cia.hpp"
+// torch
+#include <c10/core/GradMode.h>
+#include <c10/core/InferenceMode.h>
 
+// harp
 #include <harp/math/interpolation.hpp>
 #include <harp/utils/netcdf_opacity_utils.hpp>
+
+#include "molecule_cia.hpp"
 
 namespace harp {
 
@@ -44,7 +48,7 @@ void MoleculeCIAImpl::reset() {
   int del_temp_id = -1;
   check_nc(nc_inq_varid(fileid, "del_temperature", &del_temp_id),
            "Missing required variable del_temperature");
-  temperature_anomaly = convert_temperature_to_k(
+  temperature_anomaly = convert_temperature_interval_to_k(
       read_1d_variable(fileid, "del_temperature"),
       read_var_units(fileid, del_temp_id), "del_temperature");
 
@@ -156,11 +160,29 @@ torch::Tensor MoleculeCIAImpl::forward(
                                  warned_temperature_anomaly_bounds);
   }
 
+  // Leave each query at the shape its values actually vary over and let
+  // interpn broadcast them, as MoleculeLine does. Expanding all three to
+  // (nwave, ncol, nlyr) first made the pressure and temperature searches
+  // repeat once per wavenumber, and the wavenumber search repeat once per
+  // (column, layer). When a gradient flows through the interpolation, expand
+  // them anyway: with compact queries the backward sums over wavenumber
+  // before the bracket weights cancel, which costs float32 accuracy.
+  bool const expand_queries =
+      c10::GradMode::is_enabled() && !c10::InferenceMode::is_enabled() &&
+      (wave_query.requires_grad() || lnp.requires_grad() ||
+       del_temp.requires_grad() || wavenumber.requires_grad() ||
+       ln_pressure.requires_grad() || temperature_anomaly.requires_grad() ||
+       ln_temperature_base.requires_grad() || ln_sigma_binary.requires_grad());
+
   int const nwave = wave_query.size(0);
-  auto wave =
-      wave_query.unsqueeze(-1).unsqueeze(-1).expand({nwave, ncol, nlyr});
-  auto lnp_grid = lnp.unsqueeze(0).expand({nwave, ncol, nlyr});
-  auto temp_grid = del_temp.unsqueeze(0).expand({nwave, ncol, nlyr});
+  auto wave = wave_query.view({nwave, 1, 1});
+  auto lnp_grid = lnp.unsqueeze(0);
+  auto temp_grid = del_temp.unsqueeze(0);
+  if (expand_queries) {
+    wave = wave_query.unsqueeze(-1).unsqueeze(-1).expand({nwave, ncol, nlyr});
+    lnp_grid = lnp_grid.expand({nwave, ncol, nlyr});
+    temp_grid = temp_grid.expand({nwave, ncol, nlyr});
+  }
 
   // Clamp queries to the tabulated bounds. Extrapolating logarithmic CIA
   // coefficients can produce nonphysical opacity outside the table coverage.

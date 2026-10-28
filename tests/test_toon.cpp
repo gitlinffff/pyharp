@@ -194,6 +194,63 @@ TEST_P(DeviceTest, shortwave_surface_albedo_reflection) {
   }
 }
 
+// The midpoint channels must be the flux at half the layer's optical depth.
+// Splitting every layer into two identical halves puts a level exactly at each
+// original midpoint and leaves the two-stream solution unchanged, so the
+// midpoint channels of the original column must match those levels. The column
+// carries an optically thick, strongly scattering layer: there the beam is gone
+// by the midpoint while the cloud-top reflection is not, and top-of-layer
+// diffuse fluxes with a midpoint beam gave a net upward shortwave flux.
+TEST_P(DeviceTest, shortwave_midpoint_matches_split_layers) {
+  auto op = harp::ToonMcKay89OptionsImpl::create();
+  op->wave_lower({200., 500.});
+  op->wave_upper({500., 1000.});
+
+  harp::ToonMcKay89 toon(op);
+  toon->to(device, dtype);
+
+  int nwave = 2, ncol = 2, nlyr = 8, cloud = 5;  // layer index 0 is the bottom
+  auto prop =
+      torch::zeros({nwave, ncol, nlyr, 3}, torch::device(device).dtype(dtype));
+  prop.select(-1, 0).fill_(0.05);
+  prop.select(-1, 1).fill_(0.3);
+  prop.select(-1, 2).fill_(0.2);
+  prop.select(2, cloud).select(-1, 0).fill_(40.0);
+  prop.select(2, cloud).select(-1, 1).fill_(0.999);
+  prop.select(2, cloud).select(-1, 2).fill_(0.85);
+
+  auto split = prop.repeat_interleave(2, /*dim=*/2).clone();
+  split.select(-1, 0).mul_(0.5);
+
+  std::map<std::string, torch::Tensor> bc;
+  bc["fbeam"] = torch::full({nwave, ncol}, 1000.0, prop.options());
+  bc["umu0"] = torch::tensor({1.0, 0.4}, prop.options());
+  bc["albedo"] = torch::full({nwave, ncol}, 0.1, prop.options());
+  auto bc_split = bc;
+
+  auto flx = toon(prop, &bc);               // (nwave, ncol, nlyr + 1, 4)
+  auto flx_split = toon(split, &bc_split);  // (nwave, ncol, 2 nlyr + 1, 4)
+
+  // Output level j (bottom first) holds the midpoint of the layer below it,
+  // which is level 2 j - 1 of the split column.
+  auto j = torch::arange(1, nlyr + 1, torch::kLong).to(flx.device());
+  auto mid = flx.index_select(2, j).narrow(-1, 2, 2);
+  auto ref = flx_split.index_select(2, 2 * j - 1).narrow(-1, 0, 2);
+
+  double tol = (dtype == torch::kFloat64 ? 1e-9 : 2e-3) * 1000.0;
+  double err = (mid - ref).abs().max().item<double>();
+  EXPECT_LT(err, tol) << "midpoint vs split-layer level, max |diff| = " << err;
+
+  // and the net flux at the cloud's midpoint lies between its two levels
+  auto net = flx.select(-1, 0) - flx.select(-1, 1);
+  auto net_mid = flx.select(-1, 2) - flx.select(-1, 3);
+  auto lo = torch::minimum(net.select(2, cloud), net.select(2, cloud + 1));
+  auto hi = torch::maximum(net.select(2, cloud), net.select(2, cloud + 1));
+  auto m = net_mid.select(2, cloud + 1);
+  EXPECT_TRUE(torch::all(m >= lo - tol).item<bool>());
+  EXPECT_TRUE(torch::all(m <= hi + tol).item<bool>());
+}
+
 // A hard surface of longwave albedo 1 is a mirror: over an isothermal,
 // non-scattering column it reflects all the downwelling, so the net flux at the
 // surface (output level 0) is zero. A surface that only emits (1 - albedo) B
@@ -280,8 +337,12 @@ TEST_P(DeviceTest, longwave_lambertian_partial_albedo) {
   for (double w : wuarr) wsum += w;
   const double twopi = 2.0 * M_PI;
 
+  // in double: torch::tensor(t) would take the default dtype, float32, whose
+  // rounding of the Planck value alone is above the double tolerance below
   auto b_of = [](double t) {
-    return harp::bbflux_wavenumber(1.0, 1.0e5, torch::tensor(t)).item<double>();
+    return harp::bbflux_wavenumber(1.0, 1.0e5,
+                                   torch::tensor(t, torch::kFloat64))
+        .item<double>();
   };
   // BE_IN(0) is the top of the atmosphere, stored last in temf.
   const double b_top = b_of(t_top);
@@ -334,6 +395,96 @@ TEST_P(DeviceTest, longwave_lambertian_partial_albedo) {
   EXPECT_LT(std::abs(balance), tol) << "surface balance " << balance;
   EXPECT_LT(std::abs(up_toa - fup_toa), tol)
       << "TOA up flux " << up_toa << " expected " << fup_toa;
+}
+
+TEST_P(DeviceTest, longwave_resonance_is_continuous) {
+  double constexpr u = 0.5620251898;
+  double constexpr w0 = 1.0 - 1.0 / (4.0 * u * u);
+  double const relative_offset = dtype == torch::kFloat64 ? 1.0e-7 : 1.0e-3;
+
+  auto op = harp::ToonMcKay89OptionsImpl::create();
+  op->wave_lower({1.0});
+  op->wave_upper({1.0e5});
+  op->flags("planck,hard_surface");
+  harp::ToonMcKay89 toon(op);
+  toon->to(device, dtype);
+
+  auto solve = [&](double scattering_albedo) {
+    auto prop = torch::zeros({1, 1, 1, 3}, torch::device(device).dtype(dtype));
+    prop.select(-1, 0).fill_(1.0);
+    prop.select(-1, 1).fill_(scattering_albedo);
+    auto temf = torch::tensor({600.0, 300.0}, prop.options()).view({1, 2});
+    std::map<std::string, torch::Tensor> bc;
+    bc["albedo"] = torch::full({1, 1}, 0.2, prop.options());
+    return toon(prop, &bc, /*band=*/"", temf);
+  };
+
+  auto exact = solve(w0);
+  auto below = solve(w0 * (1.0 - relative_offset));
+  auto above = solve(w0 * (1.0 + relative_offset));
+  auto reference = 0.5 * (below + above);
+
+  EXPECT_TRUE(torch::all(torch::isfinite(exact.cpu())).item<bool>());
+  EXPECT_TRUE(torch::all(torch::isfinite(reference.cpu())).item<bool>());
+  double rtol = dtype == torch::kFloat64 ? 2.0e-6 : 5.0e-3;
+  double scale = torch::abs(reference).max().item<double>();
+  EXPECT_LT(torch::abs(exact - reference).max().item<double>(),
+            rtol * (scale + 1.0));
+}
+
+// The shortwave particular solution resonates at lambda * mu0 = 1. With g = 0,
+// lambda = sqrt(3 (1 - w0)), so w0 = 2/3 resonates with an overhead sun. The
+// fluxes are smooth there and must match the neighbouring values.
+TEST_P(DeviceTest, shortwave_resonance_is_continuous) {
+  double constexpr w0 = 2.0 / 3.0;
+  double const relative_offset = dtype == torch::kFloat64 ? 1.0e-4 : 1.0e-2;
+
+  auto op = harp::ToonMcKay89OptionsImpl::create();
+  op->wave_lower({200.0});
+  op->wave_upper({500.0});
+  harp::ToonMcKay89 toon(op);
+  toon->to(device, dtype);
+
+  auto solve = [&](double scattering_albedo) {
+    auto prop = torch::zeros({1, 1, 4, 3}, torch::device(device).dtype(dtype));
+    prop.select(-1, 0).fill_(0.5);
+    prop.select(-1, 1).fill_(scattering_albedo);
+    std::map<std::string, torch::Tensor> bc;
+    bc["fbeam"] = torch::ones({1, 1}, prop.options());
+    bc["umu0"] = torch::ones({1}, prop.options());
+    bc["albedo"] = torch::full({1, 1}, 0.1, prop.options());
+    return toon(prop, &bc);
+  };
+
+  auto exact = solve(w0);
+  auto below = solve(w0 * (1.0 - relative_offset));
+  auto above = solve(w0 * (1.0 + relative_offset));
+  auto reference = 0.5 * (below + above);
+
+  EXPECT_TRUE(torch::all(torch::isfinite(exact.cpu())).item<bool>());
+  double rtol = dtype == torch::kFloat64 ? 1.0e-6 : 2.0e-3;
+  double scale = torch::abs(reference).max().item<double>();
+  EXPECT_LT(torch::abs(exact - reference).max().item<double>(), rtol * scale);
+}
+
+TEST_P(DeviceTest, longwave_uncapped_ratio_avoids_overflow) {
+  auto op = harp::ToonMcKay89OptionsImpl::create();
+  op->wave_lower({1.0});
+  op->wave_upper({1.0e5});
+  op->flags("planck,hard_surface");
+  harp::ToonMcKay89 toon(op);
+  toon->to(device, dtype);
+
+  auto prop = torch::zeros({1, 1, 1, 3}, torch::device(device).dtype(dtype));
+  prop.select(-1, 0).fill_(1000.0);
+  prop.select(-1, 1).fill_(0.999999);
+  auto temf = torch::tensor({600.0, 300.0}, prop.options()).view({1, 2});
+  std::map<std::string, torch::Tensor> bc;
+  bc["albedo"] = torch::full({1, 1}, 0.2, prop.options());
+
+  auto result = toon(prop, &bc, /*band=*/"", temf);
+
+  EXPECT_TRUE(torch::all(torch::isfinite(result.cpu())).item<bool>());
 }
 
 int main(int argc, char** argv) {

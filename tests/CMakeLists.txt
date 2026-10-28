@@ -5,6 +5,8 @@
 enable_testing()
 
 setup_test(test_attenuator)
+setup_test(test_band_accumulate)
+setup_test(test_cia_autograd)
 setup_test(test_interpn)
 setup_test(test_hypsometric)
 setup_test(test_trapez)
@@ -17,6 +19,7 @@ setup_test(test_water_cloud_temperature)
 #setup_test(test_yaml_input)
 setup_test(test_tridiag)
 setup_test(test_toon)
+setup_test(test_scattering_functions)
 
 # Python tests
 

@@ -3,6 +3,8 @@
 #include <stdbool.h>
 #include <stdlib.h>
 
+#include <limits>
+
 // base
 #include <configure.h>
 
@@ -15,10 +17,9 @@
 #define W_IN(i) prop[(nlay - (i) - 1) * len1 + 1]
 #define G_IN(i) prop[(nlay - (i) - 1) * len1 + 2]
 // 4 channels per level: [0]=level up, [1]=level down,
-// [2]=layer-midpoint up, [3]=layer-midpoint down. Shortwave is smooth and (in
-// the RCE solve) frozen, so it is not the source of the period-2 null mode;
-// the midpoint channels are set equal to the level channels (good to O(dtau))
-// at the end of this routine. Level channels [0,1] are unchanged.
+// [2]=layer-midpoint up, [3]=layer-midpoint down. The midpoint channels are
+// the layer solution at half its optical depth, filled at the end of this
+// routine. Level channels [0,1] are unchanged.
 #define FLX_UP(i) flx[4 * (nlev - (i) - 1)]
 #define FLX_DN(i) flx[4 * (nlev - (i) - 1) + 1]
 #define MU_IN(i) mu_in[nlev - (i) - 1]
@@ -28,41 +29,42 @@ namespace harp {
 template <typename T>
 DISPATCH_MACRO void toon_mckay89_shortwave(int nlay, T F0_in, T const* mu_in,
                                            T const* prop, T w_surf_in, T* flx,
-                                           int len1, char* work) {
+                                           int len1, char* work,
+                                           int wstride = 1) {
   int nlev = nlay + 1;
   int l = 2 * nlay;
   int lm2 = l - 2;
   int lm1 = l - 1;
 
   // --- Memory Allocation ---
-  T* dir = alloc_from<T>(work, nlev);
-  T* tau = alloc_from<T>(work, nlev);
-  T* cum_trans = alloc_from<T>(work, nlev);
-  T* tau_in = alloc_from<T>(work, nlev);
-  T* dtau = alloc_from<T>(work, nlay);
-  T* mu_zm = alloc_from<T>(work, nlay);
-  T* w0 = alloc_from<T>(work, nlay);
-  T* hg = alloc_from<T>(work, nlay);
-  T* gam = alloc_from<T>(work, nlay);
-  T* Am = alloc_from<T>(work, nlay);
-  T* Ap = alloc_from<T>(work, nlay);
-  T* Cpm1 = alloc_from<T>(work, nlay);
-  T* Cmm1 = alloc_from<T>(work, nlay);
-  T* Cp = alloc_from<T>(work, nlay);
-  T* Cm = alloc_from<T>(work, nlay);
-  T* Ep = alloc_from<T>(work, nlay);
-  T* Em = alloc_from<T>(work, nlay);
-  T* E1 = alloc_from<T>(work, nlay);
-  T* E2 = alloc_from<T>(work, nlay);
-  T* E3 = alloc_from<T>(work, nlay);
-  T* E4 = alloc_from<T>(work, nlay);
-  T* Af = alloc_from<T>(work, l);
-  T* Bf = alloc_from<T>(work, l);
-  T* Cf = alloc_from<T>(work, l);
-  T* Df = alloc_from<T>(work, l);
-  T* xk = alloc_from<T>(work, l);
-  T* xk1 = alloc_from<T>(work, nlay);
-  T* xk2 = alloc_from<T>(work, nlay);
+  auto dir = alloc_strided<T>(work, nlev, wstride);
+  auto tau = alloc_strided<T>(work, nlev, wstride);
+  auto cum_trans = alloc_strided<T>(work, nlev, wstride);
+  auto tau_in = alloc_strided<T>(work, nlev, wstride);
+  auto dtau = alloc_strided<T>(work, nlay, wstride);
+  auto mu_zm = alloc_strided<T>(work, nlay, wstride);
+  auto w0 = alloc_strided<T>(work, nlay, wstride);
+  auto hg = alloc_strided<T>(work, nlay, wstride);
+  auto gam = alloc_strided<T>(work, nlay, wstride);
+  auto Am = alloc_strided<T>(work, nlay, wstride);
+  auto Ap = alloc_strided<T>(work, nlay, wstride);
+  auto Cpm1 = alloc_strided<T>(work, nlay, wstride);
+  auto Cmm1 = alloc_strided<T>(work, nlay, wstride);
+  auto Cp = alloc_strided<T>(work, nlay, wstride);
+  auto Cm = alloc_strided<T>(work, nlay, wstride);
+  auto Ep = alloc_strided<T>(work, nlay, wstride);
+  auto Em = alloc_strided<T>(work, nlay, wstride);
+  auto E1 = alloc_strided<T>(work, nlay, wstride);
+  auto E2 = alloc_strided<T>(work, nlay, wstride);
+  auto E3 = alloc_strided<T>(work, nlay, wstride);
+  auto E4 = alloc_strided<T>(work, nlay, wstride);
+  auto Af = alloc_strided<T>(work, l, wstride);
+  auto Bf = alloc_strided<T>(work, l, wstride);
+  auto Cf = alloc_strided<T>(work, l, wstride);
+  auto Df = alloc_strided<T>(work, l, wstride);
+  auto xk = alloc_strided<T>(work, l, wstride);
+  auto xk1 = alloc_strided<T>(work, nlay, wstride);
+  auto xk2 = alloc_strided<T>(work, nlay, wstride);
 
   const T sqrt3 = sqrt(3.0);
   const T sqrt3d2 = sqrt3 / 2.0;
@@ -146,12 +148,22 @@ DISPATCH_MACRO void toon_mckay89_shortwave(int nlay, T F0_in, T const* mu_in,
       T g1 = sqrt3d2 * (2.0 - w0[i] * (1.0 + hg[i]));
       T g2 = (sqrt3d2 * w0[i]) * (1.0 - hg[i]);
       if (g2 == 0.0) g2 = 1.0e-10;
-      T g3 = (1.0 - sqrt3 * hg[i] * mu_zm[i]) / 2.0;
-      T g4 = 1.0 - g3;
       T lam = sqrt(g1 * g1 - g2 * g2);
       gam[i] = (g1 - lam) / g2;
+      // The particular solution resonates at lam * mu0 = 1. The fluxes stay
+      // finite there, but A+- blow up as 1 / (lam * mu0 - 1) and the
+      // tridiagonal solve cancels them, losing eps / |lam * mu0 - 1| relative
+      // accuracy. Within sqrt(eps) of resonance, move this layer's mu0 to
+      // lam * mu0 = 1 +- sqrt(eps): the fluxes are smooth in mu0, so the
+      // perturbation costs O(sqrt(eps)) as well (cf. TWOSTR, Kylling 1995).
+      T const res_tol = sqrt(std::numeric_limits<T>::epsilon());
+      T res = lam * mu_zm[i] - 1.0;
+      if (fabs(res) < res_tol) {
+        mu_zm[i] = (1.0 + (res < 0.0 ? -res_tol : res_tol)) / lam;
+      }
+      T g3 = (1.0 - sqrt3 * hg[i] * mu_zm[i]) / 2.0;
+      T g4 = 1.0 - g3;
       T denom = (lam * lam) - 1.0 / (mu_zm[i] * mu_zm[i]);
-      if (denom == 0.0) denom = 1.0e-10;
       Ap[i] = F0_in * w0[i] * (g3 * (g1 - 1.0 / mu_zm[i]) + g2 * g4) / denom;
       Am[i] = F0_in * w0[i] * (g4 * (g1 + 1.0 / mu_zm[i]) + g2 * g3) / denom;
       Cpm1[i] = Ap[i] * exp(-tau[i] / mu_zm[i]);
@@ -231,8 +243,9 @@ DISPATCH_MACRO void toon_mckay89_shortwave(int nlay, T F0_in, T const* mu_in,
     }*/
   }
 
-  // Midpoint channels [2]=mid up, [3]=mid down. Start from the level value: the
-  // diffuse up/down are smooth (O(dtau) accurate at the midpoint).
+  // Midpoint channels [2]=mid up, [3]=mid down. Start from the level value;
+  // the loop below replaces every layer's midpoint (the bottom level, which
+  // tops no layer, keeps it).
   for (int j = 0; j < nlev; j++) {
     flx[4 * j + 2] = flx[4 * j];
     flx[4 * j + 3] = flx[4 * j + 1];
@@ -245,8 +258,8 @@ DISPATCH_MACRO void toon_mckay89_shortwave(int nlay, T F0_in, T const* mu_in,
   // FLX_DN_MID(k) makes the SW layer-midpoint net flux match PICASO's
   // flux_net_v_layer to leading order. Without it the combined LW+SW midpoint
   // residual is INCONSISTENT (true LW midpoint + level-approx SW) and the RCE
-  // Newton drifts off irradiated (inversion) fixed points. UP is unaffected
-  // (the beam is downward only). all_zero_w case: FLX_DN itself IS the beam.
+  // Newton drifts off irradiated (inversion) fixed points. all_zero_w case:
+  // FLX_DN itself IS the beam and there is no diffuse flux.
   // FLX_DN_MID(k)=flx[4*(nlev-k-1)+3].
   for (int k = 0; k < nlay; k++) {
     T dir_k, dir_kp1;
@@ -258,7 +271,25 @@ DISPATCH_MACRO void toon_mckay89_shortwave(int nlay, T F0_in, T const* mu_in,
       dir_kp1 = dir[k + 1];
     }
     T dir_mid = sqrt(fmax(dir_k * dir_kp1, (T)0.0));
-    flx[4 * (nlev - k - 1) + 3] = flx[4 * (nlev - k - 1) + 1] - dir_k + dir_mid;
+    if (all_zero_w) {
+      flx[4 * (nlev - k - 1) + 3] =
+          flx[4 * (nlev - k - 1) + 1] - dir_k + dir_mid;
+      continue;
+    }
+    // Diffuse fluxes at the midpoint from the layer's own solution at
+    // t = dtau / 2 (t measured down from the layer top), the same expressions
+    // that give FLX_UP / FLX_DN at t = 0 and t = dtau. Keeping the top-of-layer
+    // diffuse values while moving the beam to the midpoint is not O(dtau) in
+    // an optically thick layer: under a thick cloud the beam is gone by the
+    // midpoint but the cloud-top reflection is still counted, and the net
+    // flux comes out upward.
+    T Epm = sqrt(Ep[k]);
+    T Emm = 1.0 / Epm;
+    T Cmid = exp(-(tau[k] + 0.5 * dtau[k]) / mu_zm[k]);
+    flx[4 * (nlev - k - 1) + 2] =
+        xk1[k] * Epm + gam[k] * xk2[k] * Emm + Ap[k] * Cmid;
+    flx[4 * (nlev - k - 1) + 3] =
+        gam[k] * xk1[k] * Epm + xk2[k] * Emm + Am[k] * Cmid + dir_mid;
   }
 }
 

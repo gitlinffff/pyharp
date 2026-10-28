@@ -65,7 +65,9 @@ add_library(pyharp::harp ALIAS ${namel}_${buildl})
 if (CUDAToolkit_FOUND)
   file(GLOB cu_src_files
       integrator/*.cu
+      math/*.cu
       opacity/*.cu
+      radiation/*.cu
       rtsolver/*.cu
       )
 
